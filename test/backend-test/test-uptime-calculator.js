@@ -68,6 +68,79 @@ describe("Uptime Calculator", () => {
         assert.strictEqual(divisionKey, dayjs.utc("2023-08-12 20:46:00").unix());
     });
 
+    test("missing cleanup buckets are not created when createIfMissing is false", () => {
+        let c2 = new UptimeCalculator();
+
+        c2.getMinutelyKey(dayjs.utc("2023-08-12 20:46:59"));
+        c2.getHourlyKey(dayjs.utc("2023-08-12 20:46:59"));
+        c2.getDailyKey(dayjs.utc("2023-08-12 20:46:59"));
+
+        let minutelyCleanupKey = c2.getMinutelyKey(dayjs.utc("2023-08-11 20:46:59"), false);
+        let hourlyCleanupKey = c2.getHourlyKey(dayjs.utc("2023-07-13 20:46:59"), false);
+        let dailyCleanupKey = c2.getDailyKey(dayjs.utc("2022-08-12 20:46:59"), false);
+
+        assert.strictEqual(c2.minutelyUptimeDataList.length(), 1);
+        assert.strictEqual(c2.hourlyUptimeDataList.length(), 1);
+        assert.strictEqual(c2.dailyUptimeDataList.length(), 1);
+        assert.strictEqual(c2.minutelyUptimeDataList[minutelyCleanupKey], undefined);
+        assert.strictEqual(c2.hourlyUptimeDataList[hourlyCleanupKey], undefined);
+        assert.strictEqual(c2.dailyUptimeDataList[dailyCleanupKey], undefined);
+    });
+
+    test("cleanup lookup should not create missing minutely/hourly buckets", () => {
+        let startDate = dayjs.utc("2023-08-12 00:00:00");
+
+        // First test the broken version that creates missing buckets during cleanup lookup.
+        let broken = new UptimeCalculator();
+        let minutelyQueueLimit = broken.minutelyUptimeDataList.__limit;
+        let hourlyQueueLimit = broken.hourlyUptimeDataList.__limit;
+        let totalTicks = Math.max(minutelyQueueLimit, hourlyQueueLimit);
+
+        let minutelyEndDate = startDate;
+        let hourlyEndDate = startDate;
+        for (let tick = 0; tick < totalTicks; tick++) {
+            minutelyEndDate = startDate.add(tick, "minute");
+            hourlyEndDate = startDate.add(tick, "hour");
+
+            // Simulate normal key lookup that creates buckets.
+            broken.getMinutelyKey(minutelyEndDate);
+            broken.getHourlyKey(hourlyEndDate);
+
+            // Simulate pre-fix cleanup key lookup that accidentally creates missing buckets.
+            broken.getMinutelyKey(minutelyEndDate.subtract(broken.statMinutelyKeepHour, "hour"));
+            broken.getHourlyKey(hourlyEndDate.subtract(broken.statHourlyKeepDay, "day"));
+        }
+
+        UptimeCalculator.currentDate = minutelyEndDate;
+        assert.strictEqual(broken.getDataArray(minutelyQueueLimit, "minute").length, minutelyQueueLimit / 2);
+
+        UptimeCalculator.currentDate = hourlyEndDate;
+        assert.strictEqual(broken.getDataArray(hourlyQueueLimit, "hour").length, hourlyQueueLimit / 2);
+
+        // Now test the fixed version that should not create missing buckets.
+        let fixed = new UptimeCalculator();
+        let fixedMinutelyTickDate = startDate;
+        let fixedHourlyTickDate = startDate;
+        for (let tick = 0; tick < totalTicks; tick++) {
+            fixedMinutelyTickDate = startDate.add(tick, "minute");
+            fixedHourlyTickDate = startDate.add(tick, "hour");
+
+            // Simulate normal key lookup that creates buckets.
+            fixed.getMinutelyKey(fixedMinutelyTickDate);
+            fixed.getHourlyKey(fixedHourlyTickDate);
+
+            // Simulate pre-fix cleanup key lookup that should not create missing buckets.
+            fixed.getMinutelyKey(fixedMinutelyTickDate.subtract(fixed.statMinutelyKeepHour, "hour"), false);
+            fixed.getHourlyKey(fixedHourlyTickDate.subtract(fixed.statHourlyKeepDay, "day"), false);
+        }
+
+        UptimeCalculator.currentDate = minutelyEndDate;
+        assert.strictEqual(fixed.getDataArray(minutelyQueueLimit, "minute").length, minutelyQueueLimit);
+
+        UptimeCalculator.currentDate = hourlyEndDate;
+        assert.strictEqual(fixed.getDataArray(hourlyQueueLimit, "hour").length, hourlyQueueLimit);
+    });
+
     test("getDailyKey() returns correct timestamp for start of day", () => {
         let c2 = new UptimeCalculator();
         let dailyKey = c2.getDailyKey(dayjs.utc("2023-08-12 20:46:00"));
@@ -348,61 +421,65 @@ describe("Uptime Calculator", () => {
     });
 
     describe("Worst case scenario", () => {
-        test("handles year-long simulation with various statuses", {
-            skip: process.env.GITHUB_ACTIONS // Not stable on GitHub Actions"
-        }, async (t) => {
-            console.log("Memory usage before preparation", memoryUsage());
-
-            let c = new UptimeCalculator();
-            let up = 0;
-            let down = 0;
-            let interval = 20;
-
-            await t.test("Prepare data", async () => {
-                UptimeCalculator.currentDate = dayjs.utc("2023-08-12 20:46:59");
-
-                // Since 2023-08-12 will be out of 365 range, it starts from 2023-08-13 actually
-                let actualStartDate = dayjs.utc("2023-08-13 00:00:00").unix();
-
-                // Simulate 1s interval for a year
-                for (let i = 0; i < 365 * 24 * 60 * 60; i += interval) {
-                    UptimeCalculator.currentDate = UptimeCalculator.currentDate.add(interval, "second");
-
-                    //Randomly UP, DOWN, MAINTENANCE, PENDING
-                    let rand = Math.random();
-                    if (rand < 0.25) {
-                        c.update(UP);
-                        if (UptimeCalculator.currentDate.unix() > actualStartDate) {
-                            up++;
-                        }
-                    } else if (rand < 0.5) {
-                        c.update(DOWN);
-                        if (UptimeCalculator.currentDate.unix() > actualStartDate) {
-                            down++;
-                        }
-                    } else if (rand < 0.75) {
-                        c.update(MAINTENANCE);
-                        if (UptimeCalculator.currentDate.unix() > actualStartDate) {
-                            //up++;
-                        }
-                    } else {
-                        c.update(PENDING);
-                        if (UptimeCalculator.currentDate.unix() > actualStartDate) {
-                            down++;
-                        }
-                    }
-                }
-                console.log("Final Date: ", UptimeCalculator.currentDate.format("YYYY-MM-DD HH:mm:ss"));
+        test(
+            "handles year-long simulation with various statuses",
+            {
+                skip: process.env.GITHUB_ACTIONS, // Not stable on GitHub Actions"
+            },
+            async (t) => {
                 console.log("Memory usage before preparation", memoryUsage());
 
-                assert.strictEqual(c.minutelyUptimeDataList.length(), 1440);
-                assert.strictEqual(c.dailyUptimeDataList.length(), 365);
-            });
+                let c = new UptimeCalculator();
+                let up = 0;
+                let down = 0;
+                let interval = 20;
 
-            await t.test("get1YearUptime()", async () => {
-                assert.strictEqual(c.get1Year().uptime, up / (up + down));
-            });
-        });
+                await t.test("Prepare data", async () => {
+                    UptimeCalculator.currentDate = dayjs.utc("2023-08-12 20:46:59");
+
+                    // Since 2023-08-12 will be out of 365 range, it starts from 2023-08-13 actually
+                    let actualStartDate = dayjs.utc("2023-08-13 00:00:00").unix();
+
+                    // Simulate 1s interval for a year
+                    for (let i = 0; i < 365 * 24 * 60 * 60; i += interval) {
+                        UptimeCalculator.currentDate = UptimeCalculator.currentDate.add(interval, "second");
+
+                        //Randomly UP, DOWN, MAINTENANCE, PENDING
+                        let rand = Math.random();
+                        if (rand < 0.25) {
+                            c.update(UP);
+                            if (UptimeCalculator.currentDate.unix() > actualStartDate) {
+                                up++;
+                            }
+                        } else if (rand < 0.5) {
+                            c.update(DOWN);
+                            if (UptimeCalculator.currentDate.unix() > actualStartDate) {
+                                down++;
+                            }
+                        } else if (rand < 0.75) {
+                            c.update(MAINTENANCE);
+                            if (UptimeCalculator.currentDate.unix() > actualStartDate) {
+                                //up++;
+                            }
+                        } else {
+                            c.update(PENDING);
+                            if (UptimeCalculator.currentDate.unix() > actualStartDate) {
+                                down++;
+                            }
+                        }
+                    }
+                    console.log("Final Date: ", UptimeCalculator.currentDate.format("YYYY-MM-DD HH:mm:ss"));
+                    console.log("Memory usage before preparation", memoryUsage());
+
+                    assert.strictEqual(c.minutelyUptimeDataList.length(), 1440);
+                    assert.strictEqual(c.dailyUptimeDataList.length(), 365);
+                });
+
+                await t.test("get1YearUptime()", async () => {
+                    assert.strictEqual(c.get1Year().uptime, up / (up + down));
+                });
+            }
+        );
     });
 });
 
@@ -411,7 +488,7 @@ describe("Uptime Calculator", () => {
  * @returns {{rss: string, heapTotal: string, heapUsed: string, external: string}} Current memory usage
  */
 function memoryUsage() {
-    const formatMemoryUsage = (data) => `${Math.round(data / 1024 / 1024 * 100) / 100} MB`;
+    const formatMemoryUsage = (data) => `${Math.round((data / 1024 / 1024) * 100) / 100} MB`;
     const memoryData = process.memoryUsage();
 
     return {

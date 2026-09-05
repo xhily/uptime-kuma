@@ -3,6 +3,7 @@ const assert = require("node:assert");
 const { TCPMonitorType } = require("../../../server/monitor-types/tcp");
 const { UP, PENDING } = require("../../../src/util");
 const net = require("net");
+const { retryExternalService } = require("../test-util");
 
 describe("TCP Monitor", () => {
     /**
@@ -18,7 +19,7 @@ describe("TCP Monitor", () => {
                 resolve(server);
             });
 
-            server.on("error", err => {
+            server.on("error", (err) => {
                 reject(err);
             });
         });
@@ -64,10 +65,7 @@ describe("TCP Monitor", () => {
             status: PENDING,
         };
 
-        await assert.rejects(
-            tcpMonitor.check(monitor, heartbeat, {}),
-            new Error("Connection failed")
-        );
+        await assert.rejects(tcpMonitor.check(monitor, heartbeat, {}), new Error("Connection failed"));
     });
 
     test("check() rejects when TLS certificate is expired or invalid", async () => {
@@ -78,7 +76,7 @@ describe("TCP Monitor", () => {
             port: 443,
             smtpSecurity: "secure",
             isEnabledExpiryNotification: () => true,
-            handleTlsInfo: async tlsInfo => {
+            handleTlsInfo: async (tlsInfo) => {
                 return tlsInfo;
             },
         };
@@ -91,10 +89,9 @@ describe("TCP Monitor", () => {
         // Regex: contains with "TLS Connection failed:" or "Certificate is invalid"
         const regex = /TLS Connection failed:|Certificate is invalid/;
 
-        await assert.rejects(
-            tcpMonitor.check(monitor, heartbeat, {}),
-            regex
-        );
+        await retryExternalService(async () => {
+            await assert.rejects(tcpMonitor.check(monitor, heartbeat, {}), regex);
+        });
     });
 
     test("check() sets status to UP when TLS certificate is valid (SSL)", async () => {
@@ -105,7 +102,7 @@ describe("TCP Monitor", () => {
             port: 465,
             smtpSecurity: "secure",
             isEnabledExpiryNotification: () => true,
-            handleTlsInfo: async tlsInfo => {
+            handleTlsInfo: async (tlsInfo) => {
                 return tlsInfo;
             },
         };
@@ -115,8 +112,9 @@ describe("TCP Monitor", () => {
             status: PENDING,
         };
 
-        await tcpMonitor.check(monitor, heartbeat, {});
-
+        await retryExternalService(async () => {
+            await tcpMonitor.check(monitor, heartbeat, {});
+        });
         assert.strictEqual(heartbeat.status, UP);
     });
 
@@ -128,7 +126,7 @@ describe("TCP Monitor", () => {
             port: 587,
             smtpSecurity: "starttls",
             isEnabledExpiryNotification: () => true,
-            handleTlsInfo: async tlsInfo => {
+            handleTlsInfo: async (tlsInfo) => {
                 return tlsInfo;
             },
         };
@@ -138,8 +136,9 @@ describe("TCP Monitor", () => {
             status: PENDING,
         };
 
-        await tcpMonitor.check(monitor, heartbeat, {});
-
+        await retryExternalService(async () => {
+            await tcpMonitor.check(monitor, heartbeat, {});
+        });
         assert.strictEqual(heartbeat.status, UP);
     });
 
@@ -151,7 +150,7 @@ describe("TCP Monitor", () => {
             port: 587,
             smtpSecurity: "starttls",
             isEnabledExpiryNotification: () => true,
-            handleTlsInfo: async tlsInfo => {
+            handleTlsInfo: async (tlsInfo) => {
                 return tlsInfo;
             },
         };
@@ -163,10 +162,9 @@ describe("TCP Monitor", () => {
 
         const regex = /does not match certificate/;
 
-        await assert.rejects(
-            tcpMonitor.check(monitor, heartbeat, {}),
-            regex
-        );
+        await retryExternalService(async () => {
+            await assert.rejects(tcpMonitor.check(monitor, heartbeat, {}), regex);
+        });
     });
     test("check() sets status to UP for XMPP server with valid certificate (STARTTLS)", async () => {
         const tcpMonitor = new TCPMonitorType();
@@ -176,7 +174,7 @@ describe("TCP Monitor", () => {
             port: 5222,
             smtpSecurity: "starttls",
             isEnabledExpiryNotification: () => true,
-            handleTlsInfo: async tlsInfo => {
+            handleTlsInfo: async (tlsInfo) => {
                 return tlsInfo;
             },
         };
@@ -186,8 +184,57 @@ describe("TCP Monitor", () => {
             status: PENDING,
         };
 
-        await tcpMonitor.check(monitor, heartbeat, {});
-
+        await retryExternalService(async () => {
+            await tcpMonitor.check(monitor, heartbeat, {});
+        });
         assert.strictEqual(heartbeat.status, UP);
+    });
+
+    // TLS Alert checking tests
+    test("check() rejects when expecting TLS alert but connection succeeds", async () => {
+        const tcpMonitor = new TCPMonitorType();
+
+        const monitor = {
+            hostname: "google.com",
+            port: 443,
+            expected_tls_alert: "certificate_required",
+            timeout: 10,
+            isEnabledExpiryNotification: () => false,
+            getIgnoreTls: () => false,
+        };
+
+        const heartbeat = {
+            msg: "",
+            status: PENDING,
+        };
+
+        // Retry with backoff for external service reliability, expecting rejection
+        await retryExternalService(async () => {
+            await assert.rejects(
+                tcpMonitor.check(monitor, heartbeat, {}),
+                /Expected TLS alert 'certificate_required' but connection succeeded/
+            );
+        });
+    });
+
+    test("parseTlsAlertNumber() extracts alert number from error message", async () => {
+        const { parseTlsAlertNumber } = require("../../../server/monitor-types/tcp");
+
+        // Test various error message formats
+        assert.strictEqual(parseTlsAlertNumber("alert number 116"), 116);
+        assert.strictEqual(parseTlsAlertNumber("SSL alert number 42"), 42);
+        assert.strictEqual(parseTlsAlertNumber("TLS alert number 48"), 48);
+        assert.strictEqual(parseTlsAlertNumber("no alert here"), null);
+        assert.strictEqual(parseTlsAlertNumber(""), null);
+    });
+
+    test("getTlsAlertName() returns correct alert name for known codes", async () => {
+        const { getTlsAlertName } = require("../../../server/monitor-types/tcp");
+
+        assert.strictEqual(getTlsAlertName(116), "certificate_required");
+        assert.strictEqual(getTlsAlertName(42), "bad_certificate");
+        assert.strictEqual(getTlsAlertName(48), "unknown_ca");
+        assert.strictEqual(getTlsAlertName(40), "handshake_failure");
+        assert.strictEqual(getTlsAlertName(999), "unknown_alert_999");
     });
 });
